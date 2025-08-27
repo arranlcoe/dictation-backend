@@ -8,17 +8,21 @@ import bodyParser from "body-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import sqlite3 from "sqlite3";
-import { GoogleAuth } from "google-auth-library"; // <-- NEW: Import Google Auth
+import { GoogleAuth } from "google-auth-library";
 
 dotenv.config();
 
-// --- DATABASE SETUP (Unchanged) ---
+// --- DATABASE SETUP ---
 const db = new sqlite3.Database('./users.db', (err) => {
-    if (err) { console.error("Error opening database", err.message); } 
-    else {
+    if (err) {
+        console.error("Error opening database", err.message);
+    } else {
         console.log("Database connected.");
         db.run(`CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, password TEXT, subscription_active BOOLEAN DEFAULT FALSE
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            password TEXT,
+            subscription_active BOOLEAN DEFAULT FALSE
         )`);
     }
 });
@@ -27,18 +31,84 @@ const app = express();
 const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// --- MIDDLEWARE ---
 app.use(bodyParser.json());
 
-// --- PUBLIC ROUTES (Unchanged) ---
+// --- PUBLIC ROUTES ---
+
 app.get("/", (_req, res) => res.send("OK"));
-app.post("/register", async (req, res) => { /* ... (register code is unchanged) ... */ });
-app.post("/login", (req, res) => { /* ... (login code is unchanged) ... */ });
 
-// --- AUTHENTICATION MIDDLEWARE (Unchanged) ---
-const authGuard = (req, res, next) => { /* ... (authGuard code is unchanged) ... */ };
+app.post("/register", async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+        return res.status(400).json({ error: "Email and password are required." });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const sql = `INSERT INTO users (email, password) VALUES (?, ?)`;
+    db.run(sql, [email, hashedPassword], function(err) {
+        if (err) {
+            if (err.message.includes("UNIQUE")) {
+                return res.status(409).json({ error: "Email already exists." });
+            }
+            console.error(err.message);
+            return res.status(500).json({ error: "Database error during registration." });
+        }
+        res.status(201).json({ message: "User created successfully." });
+    });
+});
+
+app.post("/login", (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+        return res.status(400).json({ error: "Email and password are required." });
+    }
+
+    const sql = `SELECT * FROM users WHERE email = ?`;
+    db.get(sql, [email], async (err, user) => {
+        if (err || !user) {
+            return res.status(401).json({ error: "Invalid credentials." });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            return res.status(401).json({ error: "Invalid credentials." });
+        }
+
+        const token = jwt.sign(
+            { userId: user.id, email: user.email },
+            process.env.JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+
+        res.json({ token });
+    });
+});
 
 
-// --- NEW SECURE ROUTE: VERIFY GOOGLE PLAY PURCHASE ---
+// --- AUTHENTICATION MIDDLEWARE ---
+const authGuard = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ error: "Unauthorized: No token provided." });
+    }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ error: "Forbidden: Invalid token." });
+        }
+        req.user = user;
+        next();
+    });
+};
+
+
+// --- SECURE ROUTES ---
+
 app.post("/verify-purchase", authGuard, async (req, res) => {
     const { purchaseToken, subscriptionId } = req.body;
     const { userId } = req.user;
@@ -48,7 +118,6 @@ app.post("/verify-purchase", authGuard, async (req, res) => {
     }
 
     try {
-        // --- This section securely talks to Google's servers ---
         const auth = new GoogleAuth({
             credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
             scopes: "https://www.googleapis.com/auth/androidpublisher",
@@ -60,9 +129,7 @@ app.post("/verify-purchase", authGuard, async (req, res) => {
         
         const googleResponse = await client.request({ url });
 
-        // If the purchase is valid, Google sends back purchase details
         if (googleResponse.data && googleResponse.data.purchaseState === 0) {
-            // --- Update our database to mark the user as a subscriber ---
             const sql = `UPDATE users SET subscription_active = TRUE WHERE id = ?`;
             db.run(sql, [userId], function(err) {
                 if (err) {
@@ -71,7 +138,6 @@ app.post("/verify-purchase", authGuard, async (req, res) => {
                 res.json({ message: "Subscription verified successfully." });
             });
         } else {
-            // If the purchase is invalid, expired, or refunded
             res.status(400).json({ error: "Invalid purchase token." });
         }
     } catch (error) {
@@ -80,27 +146,25 @@ app.post("/verify-purchase", authGuard, async (req, res) => {
     }
 });
 
-
-// --- UPDATED SECURE ROUTE: TRANSCRIBE ---
 app.post("/transcribe", authGuard, (req, res) => {
     const { userId } = req.user;
 
-    // --- FINAL CHECK: Is this user a paying customer? ---
     const sql = `SELECT subscription_active FROM users WHERE id = ?`;
     db.get(sql, [userId], (err, user) => {
         if (err || !user) {
             return res.status(404).json({ error: "User not found." });
         }
         if (!user.subscription_active) {
-            return res.status(403).json({ error: "Forbidden: Active subscription required." }); // <-- The final lock!
+            return res.status(403).json({ error: "Forbidden: Active subscription required." });
         }
 
-        // If the user is a subscriber, proceed with transcription
         const uploadMiddleware = upload.single("audio");
         uploadMiddleware(req, res, async (uploadErr) => {
             if (!req.file) { return res.status(400).json({ error: "No audio file uploaded." }); }
+            
             const tempPath = req.file.path;
             const finalPath = path.join("uploads", req.file.filename + path.extname(req.file.originalname));
+
             try {
                 fs.renameSync(tempPath, finalPath);
                 const transcription = await openai.audio.transcriptions.create({
