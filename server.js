@@ -14,14 +14,20 @@ import { getAudioDurationInSeconds } from "get-audio-duration";
 
 dotenv.config();
 
+// --- DATABASE SETUP ---
 let db = new sqlite3.Database('./users.db', (err) => {
-    if (err) { console.error("Error opening database", err.message); } 
-    else {
+    if (err) {
+        console.error("Error opening database", err.message);
+    } else {
         console.log("Database connected.");
         db.serialize(() => {
             db.run(`CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, password TEXT, google_id TEXT UNIQUE, 
-                subscription_active BOOLEAN DEFAULT FALSE, free_seconds_remaining INTEGER NOT NULL DEFAULT 600
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password TEXT,
+                google_id TEXT UNIQUE,
+                subscription_active BOOLEAN DEFAULT FALSE,
+                free_seconds_remaining INTEGER NOT NULL DEFAULT 600
             )`);
         });
     }
@@ -32,8 +38,10 @@ const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const googleClient = new OAuth2Client();
+
 app.use(bodyParser.json());
 
+// --- DATABASE RESET ENDPOINT ---
 const RESET_PASSWORD = process.env.DB_RESET_PASSWORD;
 if (RESET_PASSWORD) {
     app.get(`/reset-database/${RESET_PASSWORD}`, (req, res) => {
@@ -49,6 +57,7 @@ if (RESET_PASSWORD) {
     });
 }
 
+// --- PUBLIC ROUTES ---
 app.get("/", (_req, res) => res.send("OK"));
 
 app.post("/register", async (req, res) => {
@@ -66,12 +75,11 @@ app.post("/register", async (req, res) => {
     });
 });
 
-// --- THIS FUNCTION CONTAINS THE FIX ---
 app.post("/login", (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) { return res.status(400).json({ error: "Email and password are required." }); }
     const sql = `SELECT * FROM users WHERE email = ?`;
-    db.get(sql, [email], async (err, user) => { // The stray '.' has been removed here
+    db.get(sql, [email], async (err, user) => {
         if (err || !user || !user.password) { return res.status(401).json({ error: "Invalid credentials or user signed up with Google." }); }
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) { return res.status(401).json({ error: "Invalid credentials." }); }
@@ -88,10 +96,22 @@ app.post("/auth/google", async (req, res) => {
         const payload = ticket.getPayload();
         const { sub: googleId, email } = payload;
         if (!email) { return res.status(400).json({ error: "Email not available from Google account." }); }
-        findOrCreateUserByEmail(email, googleId, (error, user) => {
-            if (error) { return res.status(500).json({ error: "Database operation failed." }); }
-            const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-            res.json({ token });
+
+        const insertSql = `INSERT OR IGNORE INTO users (email, google_id) VALUES (?, ?)`;
+        db.run(insertSql, [email, googleId], function(err) {
+            if (err) {
+                console.error("DB Error on INSERT IGNORE:", err.message);
+                return res.status(500).json({ error: "Database operation failed." });
+            }
+            const findSql = `SELECT * FROM users WHERE email = ?`;
+            db.get(findSql, [email], (err, user) => {
+                if (err || !user) {
+                    console.error("DB Error on final SELECT:", err ? err.message : "User not found after insert.");
+                    return res.status(500).json({ error: "Could not retrieve user." });
+                }
+                const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
+                res.json({ token });
+            });
         });
     } catch (error) {
         console.error("Google token verification failed:", error);
@@ -99,33 +119,7 @@ app.post("/auth/google", async (req, res) => {
     }
 });
 
-function findOrCreateUserByEmail(email, googleId, callback) {
-    const findSql = `SELECT * FROM users WHERE email = ?`;
-    db.get(findSql, [email], (err, user) => {
-        if (err) {
-            console.error("DB Error (findOrCreate - find):", err.message);
-            return callback(err);
-        }
-        if (user) { return callback(null, user); } 
-        else {
-            const insertSql = `INSERT INTO users (email, google_id) VALUES (?, ?)`;
-            db.run(insertSql, [email, googleId], function(err) {
-                if (err) {
-                    console.error("DB Error (findOrCreate - insert):", err.message);
-                    return callback(err);
-                }
-                db.get(`SELECT * FROM users WHERE id = ?`, [this.lastID], (err, newUser) => {
-                    if (err) {
-                        console.error("DB Error (findOrCreate - retrieve new):", err.message);
-                        return callback(err);
-                    }
-                    return callback(null, newUser);
-                });
-            });
-        }
-    });
-}
-
+// --- AUTHENTICATION MIDDLEWARE ---
 const authGuard = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -137,6 +131,7 @@ const authGuard = (req, res, next) => {
     });
 };
 
+// --- SECURE ROUTES ---
 app.get("/status", authGuard, (req, res) => {
     const { userId, email } = req.user;
     if (email === process.env.DEV_BYPASS_EMAIL) {
