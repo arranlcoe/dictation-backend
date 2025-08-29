@@ -14,20 +14,21 @@ import { getAudioDurationInSeconds } from "get-audio-duration";
 
 dotenv.config();
 
-// --- DATABASE SETUP ---
 const db = new sqlite3.Database('./users.db', (err) => {
     if (err) {
         console.error("Error opening database", err.message);
     } else {
         console.log("Database connected.");
-        db.run(`CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE,
-            password TEXT,
-            google_id TEXT UNIQUE,
-            subscription_active BOOLEAN DEFAULT FALSE,
-            free_seconds_remaining INTEGER NOT NULL DEFAULT 600
-        )`);
+        db.serialize(() => {
+            db.run(`CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password TEXT,
+                google_id TEXT UNIQUE,
+                subscription_active BOOLEAN DEFAULT FALSE,
+                free_seconds_remaining INTEGER NOT NULL DEFAULT 600
+            )`);
+        });
     }
 });
 
@@ -36,24 +37,18 @@ const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const googleClient = new OAuth2Client();
-
 app.use(bodyParser.json());
 
-// --- PUBLIC ROUTES ---
 app.get("/", (_req, res) => res.send("OK"));
 
 app.post("/register", async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) {
-        return res.status(400).json({ error: "Email and password are required." });
-    }
+    if (!email || !password) { return res.status(400).json({ error: "Email and password are required." }); }
     const hashedPassword = await bcrypt.hash(password, 10);
     const sql = `INSERT INTO users (email, password) VALUES (?, ?)`;
     db.run(sql, [email, hashedPassword], function(err) {
         if (err) {
-            if (err.message.includes("UNIQUE")) {
-                return res.status(409).json({ error: "Email already exists." });
-            }
+            if (err.message.includes("UNIQUE")) { return res.status(409).json({ error: "Email already exists." }); }
             console.error(err.message);
             return res.status(500).json({ error: "Database error during registration." });
         }
@@ -63,18 +58,12 @@ app.post("/register", async (req, res) => {
 
 app.post("/login", (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) {
-        return res.status(400).json({ error: "Email and password are required." });
-    }
+    if (!email || !password) { return res.status(400).json({ error: "Email and password are required." }); }
     const sql = `SELECT * FROM users WHERE email = ?`;
     db.get(sql, [email], async (err, user) => {
-        if (err || !user || !user.password) {
-            return res.status(401).json({ error: "Invalid credentials or user signed up with Google." });
-        }
+        if (err || !user || !user.password) { return res.status(401).json({ error: "Invalid credentials or user signed up with Google." }); }
         const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) {
-            return res.status(401).json({ error: "Invalid credentials." });
-        }
+        if (!isMatch) { return res.status(401).json({ error: "Invalid credentials." }); }
         const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.json({ token });
     });
@@ -82,42 +71,17 @@ app.post("/login", (req, res) => {
 
 app.post("/auth/google", async (req, res) => {
     const { idToken } = req.body;
-    if (!idToken) {
-        return res.status(400).json({ error: "Google ID Token is required." });
-    }
+    if (!idToken) { return res.status(400).json({ error: "Google ID Token is required." }); }
     try {
-        const ticket = await googleClient.verifyIdToken({
-            idToken: idToken,
-            audience: process.env.GOOGLE_CLIENT_ID,
-        });
+        const ticket = await googleClient.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
         const payload = ticket.getPayload();
         const { sub: googleId, email } = payload;
-        if (!email) {
-            return res.status(400).json({ error: "Email not available from Google account." });
-        }
+        if (!email) { return res.status(400).json({ error: "Email not available from Google account." }); }
 
-        const sql = `SELECT * FROM users WHERE email = ?`;
-        db.get(sql, [email], (err, user) => {
-            if (err) {
-                console.error("Database error on google auth:", err.message);
-                return res.status(500).json({ error: "Database error." });
-            }
-
-            if (user) {
-                const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-                return res.json({ token });
-            } else {
-                const insertSql = `INSERT INTO users (email, google_id) VALUES (?, ?)`;
-                db.run(insertSql, [email, googleId], function(err) {
-                    if (err) {
-                        console.error("Database error creating user:", err.message);
-                        return res.status(500).json({ error: "Could not create user." });
-                    }
-                    const newUserId = this.lastID;
-                    const token = jwt.sign({ userId: newUserId, email: email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-                    return res.json({ token });
-                });
-            }
+        findOrCreateUserByEmail(email, googleId, (error, user) => {
+            if (error) { return res.status(500).json({ error: "Database operation failed." }); }
+            const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
+            res.json({ token });
         });
     } catch (error) {
         console.error("Google token verification failed:", error);
@@ -125,48 +89,57 @@ app.post("/auth/google", async (req, res) => {
     }
 });
 
-// --- AUTHENTICATION MIDDLEWARE ---
+function findOrCreateUserByEmail(email, googleId, callback) {
+    const findSql = `SELECT * FROM users WHERE email = ?`;
+    db.get(findSql, [email], (err, user) => {
+        if (err) {
+            console.error("DB Error (findOrCreate - find):", err.message);
+            return callback(err);
+        }
+        if (user) {
+            return callback(null, user);
+        } else {
+            const insertSql = `INSERT INTO users (email, google_id) VALUES (?, ?)`;
+            db.run(insertSql, [email, googleId], function(err) {
+                if (err) {
+                    console.error("DB Error (findOrCreate - insert):", err.message);
+                    return callback(err);
+                }
+                db.get(`SELECT * FROM users WHERE id = ?`, [this.lastID], (err, newUser) => {
+                    if (err) {
+                        console.error("DB Error (findOrCreate - retrieve new):", err.message);
+                        return callback(err);
+                    }
+                    return callback(null, newUser);
+                });
+            });
+        }
+    });
+}
+
 const authGuard = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) {
-        return res.status(401).json({ error: "Unauthorized: No token provided." });
-    }
+    if (!token) { return res.status(401).json({ error: "Unauthorized: No token provided." }); }
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ error: "Forbidden: Invalid token." });
-        }
+        if (err) { return res.status(403).json({ error: "Forbidden: Invalid token." }); }
         req.user = user;
         next();
     });
 };
 
-// --- SECURE ROUTES ---
 app.get("/status", authGuard, (req, res) => {
     const { userId, email } = req.user;
-    
-    console.log(`--- [1/4] /status endpoint hit for user: ${email} (ID: ${userId}) ---`);
-
     if (email === process.env.DEV_BYPASS_EMAIL) {
-        console.log("--- [2/4] Developer bypass triggered. Sending success response. ---");
         return res.json({ isSubscribed: true, freeSecondsRemaining: 999999 });
     }
-
-    console.log(`--- [2/4] Not a developer. Preparing to query database... ---`);
     const sql = `SELECT subscription_active, free_seconds_remaining FROM users WHERE id = ?`;
-
     db.get(sql, [userId], (err, user) => {
-        console.log("--- [3/4] Database callback executed. ---");
         if (err) {
-            console.error("--- [ERROR] Database error on /status:", err.message);
+            console.error("Database error on /status:", err.message);
             return res.status(500).json({ error: "Database error." });
         }
-        if (!user) {
-            console.error(`--- [ERROR] User with ID ${userId} not found in database.`);
-            return res.status(404).json({ error: "User not found." });
-        }
-        
-        console.log(`--- [4/4] User found. Sending status: subscribed=${user.subscription_active}, free_seconds=${user.free_seconds_remaining} ---`);
+        if (!user) { return res.status(404).json({ error: "User not found." }); }
         res.json({
             isSubscribed: user.subscription_active,
             freeSecondsRemaining: user.free_seconds_remaining
@@ -177,7 +150,7 @@ app.get("/status", authGuard, (req, res) => {
 app.post("/verify-purchase", authGuard, async (req, res) => {
     const { purchaseToken, subscriptionId } = req.body;
     const { userId } = req.user;
-    if (!purchaseToken || !subscriptionId) { return res.status(400).json({ error: "Purchase token and subscription ID are required." });}
+    if (!purchaseToken || !subscriptionId) { return res.status(400).json({ error: "Purchase token and subscription ID are required." }); }
     try {
         const auth = new GoogleAuth({
             credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
