@@ -14,7 +14,8 @@ import { getAudioDurationInSeconds } from "get-audio-duration";
 
 dotenv.config();
 
-const db = new sqlite3.Database('./users.db', (err) => {
+// --- DATABASE SETUP ---
+let db = new sqlite3.Database('./users.db', (err) => {
     if (err) {
         console.error("Error opening database", err.message);
     } else {
@@ -37,8 +38,27 @@ const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const googleClient = new OAuth2Client();
+
 app.use(bodyParser.json());
 
+// --- DATABASE RESET ENDPOINT (for testing) ---
+const RESET_PASSWORD = process.env.DB_RESET_PASSWORD;
+if (RESET_PASSWORD) {
+    app.get(`/reset-database/${RESET_PASSWORD}`, (req, res) => {
+        console.log("!!! DATABASE RESET INITIATED !!!");
+        db.close((err) => {
+            if (err) { return res.status(500).send("Could not close DB."); }
+            fs.unlink('./users.db', (err) => {
+                if (err) { return res.status(500).send("Could not delete DB file."); }
+                res.send("Database has been reset. The service will now restart.");
+                // This forces Render to restart the process, which will create a new, clean DB.
+                process.exit(1); 
+            });
+        });
+    });
+}
+
+// --- PUBLIC ROUTES ---
 app.get("/", (_req, res) => res.send("OK"));
 
 app.post("/register", async (req, res) => {
@@ -60,7 +80,7 @@ app.post("/login", (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) { return res.status(400).json({ error: "Email and password are required." }); }
     const sql = `SELECT * FROM users WHERE email = ?`;
-    db.get(sql, [email], async (err, user) => {
+    db.get(sql, [email], async (err, user).  => {
         if (err || !user || !user.password) { return res.status(401).json({ error: "Invalid credentials or user signed up with Google." }); }
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) { return res.status(401).json({ error: "Invalid credentials." }); }
@@ -96,9 +116,8 @@ function findOrCreateUserByEmail(email, googleId, callback) {
             console.error("DB Error (findOrCreate - find):", err.message);
             return callback(err);
         }
-        if (user) {
-            return callback(null, user);
-        } else {
+        if (user) { return callback(null, user); } 
+        else {
             const insertSql = `INSERT INTO users (email, google_id) VALUES (?, ?)`;
             db.run(insertSql, [email, googleId], function(err) {
                 if (err) {
@@ -117,6 +136,7 @@ function findOrCreateUserByEmail(email, googleId, callback) {
     });
 }
 
+// --- AUTHENTICATION MIDDLEWARE ---
 const authGuard = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -128,6 +148,7 @@ const authGuard = (req, res, next) => {
     });
 };
 
+// --- SECURE ROUTES ---
 app.get("/status", authGuard, (req, res) => {
     const { userId, email } = req.user;
     if (email === process.env.DEV_BYPASS_EMAIL) {
