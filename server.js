@@ -20,7 +20,6 @@ const db = new sqlite3.Database('./users.db', (err) => {
         console.error("Error opening database", err.message);
     } else {
         console.log("Database connected.");
-        // Updated table to include a free_seconds_remaining column
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
@@ -134,6 +133,21 @@ const authGuard = (req, res, next) => {
 };
 
 // --- SECURE ROUTES ---
+
+app.get("/status", authGuard, (req, res) => {
+    const { userId } = req.user;
+    const sql = `SELECT subscription_active, free_seconds_remaining FROM users WHERE id = ?`;
+    db.get(sql, [userId], (err, user) => {
+        if (err || !user) {
+            return res.status(404).json({ error: "User not found." });
+        }
+        res.json({
+            isSubscribed: user.subscription_active,
+            freeSecondsRemaining: user.free_seconds_remaining
+        });
+    });
+});
+
 app.post("/verify-purchase", authGuard, async (req, res) => {
     const { purchaseToken, subscriptionId } = req.body;
     const { userId } = req.user;
