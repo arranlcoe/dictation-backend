@@ -7,18 +7,18 @@ import dotenv from "dotenv";
 import bodyParser from "body-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import sqlite3 from "sqlite3"; // Using the official library
+import sqlite3 from "sqlite3"; // Using the official, stable library
 import { GoogleAuth } from "google-auth-library";
 import { OAuth2Client } from "google-auth-library";
 import { getAudioDurationInSeconds } from "get-audio-duration";
 
 dotenv.config();
 
-// --- DATABASE SETUP (Using official sqlite3 with Promises) ---
+// --- DATABASE SETUP (Using official sqlite3 with Promise wrappers for async/await) ---
 const db = new sqlite3.Database('./users.db', (err) => {
     if (err) {
         console.error("FATAL: Could not connect to database.", err.message);
-        process.exit(1);
+        process.exit(1); // Exit if we can't connect to the DB
     }
     console.log("Database connected.");
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -27,7 +27,7 @@ const db = new sqlite3.Database('./users.db', (err) => {
     )`);
 });
 
-// Helper functions to make the callback-based library work with async/await
+// Helper function to make db.get work with async/await
 function dbGet(query, params) {
     return new Promise((resolve, reject) => {
         db.get(query, params, (err, row) => {
@@ -37,6 +37,7 @@ function dbGet(query, params) {
     });
 }
 
+// Helper function to make db.run work with async/await
 function dbRun(query, params) {
     return new Promise((resolve, reject) => {
         db.run(query, params, function(err) {
@@ -47,7 +48,6 @@ function dbRun(query, params) {
 }
 
 const app = express();
-// ... (rest of setup is unchanged)
 const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -90,6 +90,7 @@ app.post("/auth/google", async (req, res) => {
         
         const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.json({ token });
+
     } catch (error) {
         console.error("Google token verification failed:", error);
         res.status(401).json({ error: "Invalid Google ID Token." });
