@@ -7,7 +7,7 @@ import dotenv from "dotenv";
 import bodyParser from "body-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { open } from "sqlite-async"; // <-- THIS IS THE CORRECT IMPORT
+import Database from "sqlite-async"; // <-- FIXED: Use default import
 import { GoogleAuth } from "google-auth-library";
 import { OAuth2Client } from "google-auth-library";
 import { getAudioDurationInSeconds } from "get-audio-duration";
@@ -17,7 +17,7 @@ dotenv.config();
 let db;
 (async () => {
     try {
-        db = await open('./users.db'); // <-- THIS IS THE CORRECT USAGE
+        db = await Database.open('./users.db'); // <-- FIXED: Use Database.open()
         console.log("Database connected.");
         await db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
