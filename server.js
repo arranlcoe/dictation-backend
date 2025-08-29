@@ -9,6 +9,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import sqlite3 from "sqlite3";
 import { GoogleAuth } from "google-auth-library";
+import { OAuth2Client } from "google-auth-library";
 
 dotenv.config();
 
@@ -18,10 +19,12 @@ const db = new sqlite3.Database('./users.db', (err) => {
         console.error("Error opening database", err.message);
     } else {
         console.log("Database connected.");
+        // Updated table to include a google_id column
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
             password TEXT,
+            google_id TEXT UNIQUE,
             subscription_active BOOLEAN DEFAULT FALSE
         )`);
     }
@@ -31,6 +34,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const googleClient = new OAuth2Client();
 
 // --- MIDDLEWARE ---
 app.use(bodyParser.json());
@@ -68,8 +72,8 @@ app.post("/login", (req, res) => {
 
     const sql = `SELECT * FROM users WHERE email = ?`;
     db.get(sql, [email], async (err, user) => {
-        if (err || !user) {
-            return res.status(401).json({ error: "Invalid credentials." });
+        if (err || !user || !user.password) { // Check if password exists for this user
+            return res.status(401).json({ error: "Invalid credentials or user signed up with Google." });
         }
 
         const isMatch = await bcrypt.compare(password, user.password);
@@ -85,6 +89,48 @@ app.post("/login", (req, res) => {
 
         res.json({ token });
     });
+});
+
+app.post("/auth/google", async (req, res) => {
+    const { idToken } = req.body;
+    if (!idToken) {
+        return res.status(400).json({ error: "Google ID Token is required." });
+    }
+
+    try {
+        const ticket = await googleClient.verifyIdToken({
+            idToken: idToken,
+            audience: process.env.GOOGLE_CLIENT_ID,
+        });
+        const payload = ticket.getPayload();
+        const { sub: googleId, email } = payload;
+
+        if (!email) {
+            return res.status(400).json({ error: "Email not available from Google account." });
+        }
+
+        db.get(`SELECT * FROM users WHERE google_id = ? OR email = ?`, [googleId, email], (err, user) => {
+            if (err) { return res.status(500).json({ error: "Database error." }); }
+
+            if (user) {
+                const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
+                return res.json({ token });
+            } else {
+                const sql = `INSERT INTO users (email, google_id) VALUES (?, ?)`;
+                db.run(sql, [email, googleId], function(err) {
+                    if (err) {
+                        return res.status(500).json({ error: "Database error creating user." });
+                    }
+                    const newUserId = this.lastID;
+                    const token = jwt.sign({ userId: newUserId, email: email }, process.env.JWT_SECRET, { expiresIn: '30d' });
+                    return res.json({ token });
+                });
+            }
+        });
+    } catch (error) {
+        console.error("Google token verification failed:", error);
+        res.status(401).json({ error: "Invalid Google ID Token." });
+    }
 });
 
 
