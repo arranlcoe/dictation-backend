@@ -7,7 +7,7 @@ import dotenv from "dotenv";
 import bodyParser from "body-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { open } from "sqlite-async";
+import Database from "sqlite-async";
 import { GoogleAuth } from "google-auth-library";
 import { OAuth2Client } from "google-auth-library";
 import { getAudioDurationInSeconds } from "get-audio-duration";
@@ -17,7 +17,7 @@ dotenv.config();
 let db;
 (async () => {
     try {
-        db = await open('./users.db');
+        db = await Database.open('./users.db');
         console.log("Database connected.");
         await db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,16 +94,13 @@ app.post("/auth/google", async (req, res) => {
         const payload = ticket.getPayload();
         const { sub: googleId, email } = payload;
         if (!email) { return res.status(400).json({ error: "Email not available from Google account." }); }
-
         let user = await db.get(`SELECT * FROM users WHERE email = ?`, [email]);
         if (!user) {
             const result = await db.run(`INSERT INTO users (email, google_id) VALUES (?, ?)`, [email, googleId]);
             user = await db.get(`SELECT * FROM users WHERE id = ?`, [result.lastID]);
         }
-        
         const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.json({ token });
-
     } catch (error) {
         console.error("Google token verification failed:", error);
         res.status(401).json({ error: "Invalid Google ID Token." });
@@ -169,11 +166,9 @@ app.post("/transcribe", authGuard, async (req, res) => {
     try {
         const user = await db.get(`SELECT subscription_active, free_seconds_remaining FROM users WHERE id = ?`, [userId]);
         if (!user) { return res.status(404).json({ error: "User not found." }); }
-        
         const isDeveloper = (email === process.env.DEV_BYPASS_EMAIL);
         const isSubscriber = user.subscription_active;
         const hasFreeTime = user.free_seconds_remaining > 0;
-        
         if (isDeveloper || isSubscriber || hasFreeTime) {
             await proceedWithTranscription(req, res, { isFreeTierUser: !isSubscriber && !isDeveloper, userId, secondsLeft: user.free_seconds_remaining });
         } else {
