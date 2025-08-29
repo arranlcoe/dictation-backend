@@ -19,7 +19,6 @@ const db = new sqlite3.Database('./users.db', (err) => {
         console.error("Error opening database", err.message);
     } else {
         console.log("Database connected.");
-        // Updated table to include a google_id column
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
@@ -72,7 +71,7 @@ app.post("/login", (req, res) => {
 
     const sql = `SELECT * FROM users WHERE email = ?`;
     db.get(sql, [email], async (err, user) => {
-        if (err || !user || !user.password) { // Check if password exists for this user
+        if (err || !user || !user.password) {
             return res.status(401).json({ error: "Invalid credentials or user signed up with Google." });
         }
 
@@ -193,8 +192,17 @@ app.post("/verify-purchase", authGuard, async (req, res) => {
 });
 
 app.post("/transcribe", authGuard, (req, res) => {
-    const { userId } = req.user;
+    const { userId, email } = req.user; // Get email from the verified token
 
+    // --- DEVELOPER BYPASS LOGIC ---
+    if (email === process.env.DEV_BYPASS_EMAIL) {
+        console.log(`DEV_BYPASS initiated for user: ${email}`);
+        proceedWithTranscription(req, res);
+        return; // Skip the subscription check
+    }
+    // ----------------------------
+
+    // --- Regular Subscription Check ---
     const sql = `SELECT subscription_active FROM users WHERE id = ?`;
     db.get(sql, [userId], (err, user) => {
         if (err || !user) {
@@ -203,29 +211,33 @@ app.post("/transcribe", authGuard, (req, res) => {
         if (!user.subscription_active) {
             return res.status(403).json({ error: "Forbidden: Active subscription required." });
         }
-
-        const uploadMiddleware = upload.single("audio");
-        uploadMiddleware(req, res, async (uploadErr) => {
-            if (!req.file) { return res.status(400).json({ error: "No audio file uploaded." }); }
-            
-            const tempPath = req.file.path;
-            const finalPath = path.join("uploads", req.file.filename + path.extname(req.file.originalname));
-
-            try {
-                fs.renameSync(tempPath, finalPath);
-                const transcription = await openai.audio.transcriptions.create({
-                    file: fs.createReadStream(finalPath),
-                    model: "whisper-1",
-                });
-                res.json({ text: transcription.text || "" });
-            } catch (transcribeErr) {
-                console.error(transcribeErr);
-                res.status(500).json({ error: "Transcription failed." });
-            } finally {
-                if (fs.existsSync(finalPath)) { fs.unlinkSync(finalPath); }
-            }
-        });
+        proceedWithTranscription(req, res);
     });
 });
+
+// Helper function for the transcription logic to avoid code duplication
+function proceedWithTranscription(req, res) {
+    const uploadMiddleware = upload.single("audio");
+    uploadMiddleware(req, res, async (uploadErr) => {
+        if (!req.file) { return res.status(400).json({ error: "No audio file uploaded." }); }
+        
+        const tempPath = req.file.path;
+        const finalPath = path.join("uploads", req.file.filename + path.extname(req.file.originalname));
+
+        try {
+            fs.renameSync(tempPath, finalPath);
+            const transcription = await openai.audio.transcriptions.create({
+                file: fs.createReadStream(finalPath),
+                model: "whisper-1",
+            });
+            res.json({ text: transcription.text || "" });
+        } catch (transcribeErr) {
+            console.error(transcribeErr);
+            res.status(500).json({ error: "Transcription failed." });
+        } finally {
+            if (fs.existsSync(finalPath)) { fs.unlinkSync(finalPath); }
+        }
+    });
+}
 
 app.listen(port, () => console.log(`🚀 Backend running on port ${port}`));
