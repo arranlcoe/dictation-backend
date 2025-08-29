@@ -144,23 +144,29 @@ const authGuard = (req, res, next) => {
 // --- SECURE ROUTES ---
 app.get("/status", authGuard, (req, res) => {
     const { userId, email } = req.user;
+    
+    console.log(`--- [1/4] /status endpoint hit for user: ${email} (ID: ${userId}) ---`);
 
     if (email === process.env.DEV_BYPASS_EMAIL) {
-        return res.json({
-            isSubscribed: true,
-            freeSecondsRemaining: 999999
-        });
+        console.log("--- [2/4] Developer bypass triggered. Sending success response. ---");
+        return res.json({ isSubscribed: true, freeSecondsRemaining: 999999 });
     }
 
+    console.log(`--- [2/4] Not a developer. Preparing to query database... ---`);
     const sql = `SELECT subscription_active, free_seconds_remaining FROM users WHERE id = ?`;
+
     db.get(sql, [userId], (err, user) => {
+        console.log("--- [3/4] Database callback executed. ---");
         if (err) {
-            console.error("Database error on /status:", err.message);
+            console.error("--- [ERROR] Database error on /status:", err.message);
             return res.status(500).json({ error: "Database error." });
         }
         if (!user) {
+            console.error(`--- [ERROR] User with ID ${userId} not found in database.`);
             return res.status(404).json({ error: "User not found." });
         }
+        
+        console.log(`--- [4/4] User found. Sending status: subscribed=${user.subscription_active}, free_seconds=${user.free_seconds_remaining} ---`);
         res.json({
             isSubscribed: user.subscription_active,
             freeSecondsRemaining: user.free_seconds_remaining
@@ -171,9 +177,7 @@ app.get("/status", authGuard, (req, res) => {
 app.post("/verify-purchase", authGuard, async (req, res) => {
     const { purchaseToken, subscriptionId } = req.body;
     const { userId } = req.user;
-    if (!purchaseToken || !subscriptionId) {
-        return res.status(400).json({ error: "Purchase token and subscription ID are required." });
-    }
+    if (!purchaseToken || !subscriptionId) { return res.status(400).json({ error: "Purchase token and subscription ID are required." });}
     try {
         const auth = new GoogleAuth({
             credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
@@ -202,18 +206,12 @@ app.post("/transcribe", authGuard, (req, res) => {
     const { userId, email } = req.user;
     const sql = `SELECT subscription_active, free_seconds_remaining FROM users WHERE id = ?`;
     db.get(sql, [userId], (err, user) => {
-        if (err || !user) {
-            return res.status(404).json({ error: "User not found." });
-        }
+        if (err || !user) { return res.status(404).json({ error: "User not found." }); }
         const isDeveloper = (email === process.env.DEV_BYPASS_EMAIL);
         const isSubscriber = user.subscription_active;
         const hasFreeTime = user.free_seconds_remaining > 0;
         if (isDeveloper || isSubscriber || hasFreeTime) {
-            proceedWithTranscription(req, res, {
-                isFreeTierUser: !isSubscriber && !isDeveloper,
-                userId,
-                secondsLeft: user.free_seconds_remaining
-            });
+            proceedWithTranscription(req, res, { isFreeTierUser: !isSubscriber && !isDeveloper, userId, secondsLeft: user.free_seconds_remaining });
         } else {
             return res.status(403).json({ error: "Forbidden: Subscription or free trial required." });
         }
@@ -224,21 +222,16 @@ async function proceedWithTranscription(req, res, usageInfo) {
     const uploadMiddleware = upload.single("audio");
     uploadMiddleware(req, res, async (uploadErr) => {
         if (!req.file) { return res.status(400).json({ error: "No audio file uploaded." }); }
-        
         const tempPath = req.file.path;
         const finalPath = path.join("uploads", req.file.filename + path.extname(req.file.originalname));
         try {
             fs.renameSync(tempPath, finalPath);
             const durationInSeconds = await getAudioDurationInSeconds(finalPath);
             const roundedDuration = Math.ceil(durationInSeconds);
-
             if (usageInfo.isFreeTierUser && usageInfo.secondsLeft < roundedDuration) {
                 return res.status(403).json({ error: "Not enough free time remaining for this recording." });
             }
-            const transcription = await openai.audio.transcriptions.create({
-                file: fs.createReadStream(finalPath),
-                model: "whisper-1",
-            });
+            const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(finalPath), model: "whisper-1" });
             if (usageInfo.isFreeTierUser) {
                 const newTime = Math.max(0, usageInfo.secondsLeft - roundedDuration);
                 db.run(`UPDATE users SET free_seconds_remaining = ? WHERE id = ?`, [newTime, usageInfo.userId]);
